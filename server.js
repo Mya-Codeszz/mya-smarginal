@@ -318,6 +318,8 @@ app.post("/api/gemini", auth, async (req, res, next) => {
 
     const system = String(req.body?.system || "");
     const jsonMode = req.body?.json === true;
+    const requestedThinking = req.body?.thinkingLevel;
+    const requestedMaxOutput = Number(req.body?.maxOutputTokens);
     const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
     const contents = messages
       .filter((m) => m && typeof m.content === "string" && m.content.trim())
@@ -328,6 +330,11 @@ app.post("/api/gemini", auth, async (req, res, next) => {
     if (!contents.length) return res.status(400).json({ error: "No message supplied." });
 
     const model = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+    const thinkingLevel = requestedThinking === "minimal" && /gemini-(3\.6|3\.5)-flash|gemini-3-flash/.test(model)
+      ? "minimal"
+      : requestedThinking === "low" && /gemini-3\.(6|7|8)-flash|gemini-3-flash/.test(model)
+      ? "low"
+      : undefined;
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
       method: "POST",
       headers: {
@@ -337,7 +344,12 @@ app.post("/api/gemini", auth, async (req, res, next) => {
       body: JSON.stringify({
         systemInstruction: system ? { parts: [{ text: system }] } : undefined,
         contents,
-        generationConfig: { temperature: jsonMode ? 0.2 : 0.7, ...(jsonMode ? { responseMimeType: "application/json" } : {}) },
+        generationConfig: {
+          temperature: jsonMode ? 0.2 : 0.7,
+          ...(jsonMode ? { responseMimeType: "application/json" } : {}),
+          ...(thinkingLevel ? { thinkingConfig: { thinkingLevel } } : {}),
+          ...(Number.isFinite(requestedMaxOutput) && requestedMaxOutput > 0 ? { maxOutputTokens: Math.min(requestedMaxOutput, 512) } : {}),
+        },
       }),
     });
 
