@@ -317,6 +317,7 @@ app.post("/api/gemini", auth, async (req, res, next) => {
     if (!apiKey) return res.status(503).json({ error: "Gemini is not configured on the server yet. Add GEMINI_API_KEY in Render." });
 
     const system = String(req.body?.system || "");
+    const jsonMode = req.body?.json === true;
     const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
     const contents = messages
       .filter((m) => m && typeof m.content === "string" && m.content.trim())
@@ -336,7 +337,7 @@ app.post("/api/gemini", auth, async (req, res, next) => {
       body: JSON.stringify({
         systemInstruction: system ? { parts: [{ text: system }] } : undefined,
         contents,
-        generationConfig: { temperature: 0.7 },
+        generationConfig: { temperature: jsonMode ? 0.2 : 0.7, ...(jsonMode ? { responseMimeType: "application/json" } : {}) },
       }),
     });
 
