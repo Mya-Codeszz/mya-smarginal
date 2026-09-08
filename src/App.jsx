@@ -195,7 +195,7 @@ function computeStats(profile) {
 
 /* ---------------- backend API helper ---------------- */
 
-async function apiRequest(path, { method = "GET", body, token } = {}) {
+async function apiRequest(path, { method = "GET", body, token, signal } = {}) {
   const res = await fetch(`/api${path}`, {
     method,
     headers: {
@@ -203,6 +203,7 @@ async function apiRequest(path, { method = "GET", body, token } = {}) {
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,
+    signal,
   });
   let data = {};
   try {
@@ -214,11 +215,12 @@ async function apiRequest(path, { method = "GET", body, token } = {}) {
   return data;
 }
 
-async function callGemini(system, userContent, token, { json = false } = {}) {
+async function callGemini(system, userContent, token, { json = false, signal, thinkingLevel, maxOutputTokens } = {}) {
   const data = await apiRequest("/gemini", {
     method: "POST",
     token,
-    body: { system, messages: [{ role: "user", content: userContent }], json },
+    body: { system, messages: [{ role: "user", content: userContent }], json, thinkingLevel, maxOutputTokens },
+    signal,
   });
   const text = (data.content || []).map((b) => (b.type === "text" ? b.text : "")).join("");
   if (json) {
@@ -415,7 +417,7 @@ export default function App() {
         />
       )}
       {page === "stats" && profile && (
-        <StatsPage userName={currentUser} profile={profile} onUpdate={persist} onLogout={handleLogout} onHome={() => setPage("landing")} onDashboard={() => setPage("dashboard")} onLibrary={() => setPage("library")} onOutline={() => setPage("outline")} onProfile={() => setPage("profile")} onSettings={() => setPage("settings")} onResearch={() => setPage("research")} onRewrite={() => setPage("rewrite")} />
+        <StatsPage userName={currentUser} profile={profile} avatar={profile.avatar} onUpdate={persist} onLogout={handleLogout} onHome={() => setPage("landing")} onDashboard={() => setPage("dashboard")} onLibrary={() => setPage("library")} onOutline={() => setPage("outline")} onProfile={() => setPage("profile")} onSettings={() => setPage("settings")} onResearch={() => setPage("research")} onRewrite={() => setPage("rewrite")} />
       )}
       {page === "library" && profile && (
         <LibraryPage
@@ -1124,7 +1126,7 @@ const PAPER_TYPE_LABELS = {
   'ap-lang': 'AP Language', research: 'Research Paper', 'ap-seminar': 'AP Seminar', 'literary-analysis': 'Literary Analysis', general: 'General Academic',
 };
 
-function StatsPage({ userName, profile, onUpdate, onLogout, onHome, onDashboard, onLibrary, onOutline, onSettings, onResearch, onProfile, onRewrite }) {
+function StatsPage({ userName, profile, avatar, onUpdate, onLogout, onHome, onDashboard, onLibrary, onOutline, onSettings, onResearch, onProfile, onRewrite }) {
   const stats = computeStats(profile);
   const [goal, setGoal] = useState(() => profile.statsGoal || 3000);
   const [range, setRange] = useState('30');
@@ -1747,6 +1749,9 @@ function Editor({ profile, token, draftId, onUpdate, onBack, showToast }) {
   const textareaRef = useRef(null);
   const overlayRef = useRef(null);
   const debounceRef = useRef(null);
+  const requestControllerRef = useRef(null);
+  const cursorRef = useRef(text.length);
+  const suggestionStartRef = useRef(text.length);
   const sessionAccepted = useRef([]);
   const sessionRejected = useRef([]);
   const saveTimer = useRef(null);
@@ -1754,58 +1759,71 @@ function Editor({ profile, token, draftId, onUpdate, onBack, showToast }) {
   const ghost = suggestions[ghostIdx] || "";
 
   const fetchSuggestions = useCallback(
-    (currentText) => {
+    (currentText, cursorPosition = currentText.length) => {
       clearTimeout(debounceRef.current);
+      cursorRef.current = cursorPosition;
       debounceRef.current = setTimeout(async () => {
-        if (!currentText.trim()) return;
+        if (!currentText.trim() || !activeVoice?.weights) return;
+        requestControllerRef.current?.abort();
+        const controller = new AbortController();
+        requestControllerRef.current = controller;
         setFetching(true);
         try {
+          const before = currentText.slice(0, cursorPosition);
+          const after = currentText.slice(cursorPosition);
+          const paragraphStart = Math.max(before.lastIndexOf("\n\n") + 2, before.lastIndexOf("\n") + 1, before.length - 1200);
+          const localBefore = before.slice(paragraphStart).slice(-1200);
+          const localAfter = after.slice(0, 500);
           const weightLines = Object.entries(activeVoice.weights)
-            .map(([k, v]) => `${k}: ${v}/100 (${v < 40 ? TRAIT_LABELS[k][0] : v > 60 ? TRAIT_LABELS[k][1] : "balanced"})`)
-            .join("\n");
+            .map(([k, v]) => `${k}: ${v}/100`)
+            .join(", ");
           const toneLine =
-            tone === "professional"
-              ? "Write this continuation in their PROFESSIONAL voice — more polished, fewer contractions."
-              : tone === "casual"
-              ? "Write this continuation in their CASUAL voice — relaxed, contractions fine."
-              : "Write this continuation in their natural, default voice.";
-          const recentRejects = [...profile.rejected, ...sessionRejected.current].slice(-8);
+            tone === "professional" ? "professional and polished" :
+            tone === "casual" ? "casual and conversational" : "the writer's natural voice";
+          const recentAccepted = [...(profile.accepted || []), ...sessionAccepted.current].slice(-12);
+          const recentRejects = [...(profile.rejected || []), ...sessionRejected.current].slice(-8);
           const result = await callGemini(
-            `You are Marginal's autocomplete engine. You continue a person's writing in their own established voice, a few words at a time — never a full paragraph. Given their style profile, trait weights, tone instruction, and the text so far, return ONLY JSON: {"suggestions": ["...", "...", "..."]} with exactly 3 short alternative continuations (2 to 12 words each). Each must pick up exactly where the text left off — include a leading space if it starts a new word, and don't repeat words already at the end of the text. Vary the 3 options in direction, not just wording. Avoid phrasing similar to these previously rejected continuations: ${JSON.stringify(recentRejects)}.
+            `You are Marginal's REAL-TIME inline writing predictor. Your job is to predict what this writer is most likely to type NEXT at the cursor, not to rewrite what they already wrote. Read both sides of the cursor. Match the writer's established voice and the selected assignment type. Return ONLY JSON: {"suggestions":["..."]}. Give exactly ONE continuation, 2–10 words, that can be inserted at the cursor. It must connect naturally to the words immediately before AND after the cursor. Do not repeat existing words. If the cursor is inside a sentence, complete the thought instead of starting a new topic. Prefer the most probable continuation over a clever alternative. Use the writer's accepted phrases as weak personalization signals, but never copy them mechanically.
 
-PAPER TYPE: ${PAPER_GUIDES[paperType]?.label || "General Academic"}
-WRITING GUIDE: ${PAPER_GUIDES[paperType]?.subtitle || ""}
-STYLE PROFILE: ${JSON.stringify(activeVoice.styleProfile)}
-TRAIT DIALS:
-${weightLines}
-PAPER TYPE: ${PAPER_GUIDES[paperType]?.label || "General Academic"}
-WRITING GUIDE: ${PAPER_GUIDES[paperType]?.subtitle || ""}
-TONE: ${toneLine}`,
-            `TEXT SO FAR (continue from the very end of this):\n${currentText.slice(-800)}`,
+WRITING TYPE: ${PAPER_GUIDES[paperType]?.label || "General Academic"}
+WRITING GUIDANCE: ${PAPER_GUIDES[paperType]?.subtitle || ""}
+VOICE: ${toneLine}
+STYLE DIALS: ${weightLines}
+RECENTLY ACCEPTED: ${JSON.stringify(recentAccepted)}
+RECENTLY REJECTED: ${JSON.stringify(recentRejects)}
+
+TEXT BEFORE CURSOR:\n${localBefore}
+\n<CURSOR>\n
+TEXT AFTER CURSOR:\n${localAfter}`,
+            `Predict the next few words at <CURSOR>.`,
             token,
-            { json: true }
+            { json: true, signal: controller.signal, thinkingLevel: "minimal", maxOutputTokens: 40 }
           );
-          setSuggestions(result.suggestions || []);
-          setGhostIdx(0);
-        } catch {
-          /* silent fail, no ghost shown */
+          if (!controller.signal.aborted) {
+            const next = Array.isArray(result.suggestions) ? result.suggestions.filter(Boolean).slice(0, 1) : [];
+            suggestionStartRef.current = cursorPosition;
+            setSuggestions(next);
+            setGhostIdx(0);
+          }
+        } catch (err) {
+          if (err?.name !== "AbortError" && err?.message !== "The user aborted a request.") {
+            /* silent fail — typing should never be interrupted by the predictor */
+          }
+        } finally {
+          if (!controller.signal.aborted) setFetching(false);
         }
-        setFetching(false);
-      }, 550);
+      }, 260);
     },
-    [activeVoice.weights, activeVoice.styleProfile, profile.rejected, tone, paperType, token]
+    [activeVoice?.weights, activeVoice?.styleProfile, profile.accepted, profile.rejected, tone, paperType, token]
   );
-
-  function atEnd() {
-    const ta = textareaRef.current;
-    return ta && ta.selectionStart === ta.value.length && ta.selectionEnd === ta.value.length;
-  }
 
   function handleChange(e) {
     const val = e.target.value;
+    const cursorPosition = e.target.selectionStart ?? val.length;
+    cursorRef.current = cursorPosition;
     setText(val);
     setSuggestions([]);
-    if (atEnd()) fetchSuggestions(val);
+    requestAnimationFrame(() => fetchSuggestions(val, cursorPosition));
     scheduleSave(val);
   }
 
@@ -1854,12 +1872,19 @@ TONE: ${toneLine}`,
 
   function acceptGhost() {
     if (!ghost) return;
-    const next = text + ghost;
+    const start = Math.max(0, Math.min(suggestionStartRef.current, text.length));
+    const end = start + ghost.length;
+    const next = text.slice(0, start) + ghost + text.slice(start);
     sessionAccepted.current.push(ghost.trim());
     setText(next);
     setSuggestions([]);
+    cursorRef.current = end;
     scheduleSave(next);
-    fetchSuggestions(next);
+    requestAnimationFrame(() => {
+      const ta = textareaRef.current;
+      if (ta) { ta.focus(); ta.setSelectionRange(end, end); }
+      fetchSuggestions(next, end);
+    });
   }
 
   function rejectGhost() {
@@ -1947,10 +1972,9 @@ ${weightLines}`,
       rejectGhost();
       return;
     }
-    // any normal printable key while a ghost is showing: treat as a soft reject
+    // Keep the predictor live while the user types through a suggestion.
     if (ghost && e.key.length === 1) {
-      const expected = ghost.trimStart()[0];
-      if (e.key !== expected) rejectGhost();
+      rejectGhost();
     }
   }
 
@@ -2053,8 +2077,9 @@ ${weightLines}`,
         <div className="mgn-editor-main">
         <div className="mgn-write-area">
           <div className="mgn-overlay" ref={overlayRef}>
-            <span className="mgn-typed">{text}</span>
+            <span className="mgn-typed">{text.slice(0, suggestionStartRef.current)}</span>
             {ghost && <span className="mgn-ghost">{ghost}</span>}
+            <span className="mgn-typed">{text.slice(suggestionStartRef.current)}</span>
           </div>
           <textarea
             ref={textareaRef}
@@ -2063,7 +2088,16 @@ ${weightLines}`,
             onChange={handleChange}
             onKeyDown={handleKeyDown}
             onScroll={handleScroll}
-            onClick={() => setSuggestions([])}
+            onClick={(e) => {
+              const pos = e.currentTarget.selectionStart ?? text.length;
+              cursorRef.current = pos;
+              setSuggestions([]);
+              fetchSuggestions(text, pos);
+            }}
+            onKeyUp={(e) => {
+              const pos = e.currentTarget.selectionStart ?? text.length;
+              cursorRef.current = pos;
+            }}
             placeholder="Start writing. Marginal will pick up your rhythm as you go…"
             spellCheck="false"
           />
@@ -2129,6 +2163,64 @@ function LibraryPage({ userName, profile, onLogout, onHome, onDashboard, onStats
 /* ================================================================
    OUTLINE BUILDER
 ================================================================ */
+const OUTLINE_SCHEMAS = {
+  "ap-lang": {
+    intro: [
+      ["Rhetorical situation / context", "Give the reader only the context needed to understand the prompt and argument."],
+      ["Central issue", "Identify the tension, debate, or task the essay must address."],
+      ["Defensible thesis", "State the position or analytical claim that answers the prompt."],
+    ],
+    body: [
+      ["Paragraph claim", "State the subclaim that advances your line of reasoning."],
+      ["Specific evidence", "Choose concrete evidence that proves the paragraph's claim."],
+      ["Commentary / reasoning", "Explain how and why the evidence supports the claim."],
+      ["Complexity / transition", "Qualify the reasoning or connect this paragraph to the next idea when useful."],
+    ],
+    conclusion: [
+      ["Synthesize the argument", "Bring the line of reasoning together without simply repeating the thesis."],
+      ["Key takeaway", "Clarify what the argument establishes."],
+      ["Larger significance", "Explain why the argument matters when the prompt calls for it."],
+    ],
+  },
+  "ap-lang-argument": {
+    intro: [["Situation / tension","Frame the issue and the tension in the prompt."],["Line of reasoning","List the major reasons that will build toward your position."],["Defensible thesis","Take a clear, arguable position."]],
+    body: [["Subclaim","State one reason that advances the argument."],["Specific example / evidence","Use a concrete example, fact, observation, or experience."],["Commentary","Explain why the evidence proves the subclaim."],["Qualification / counterargument","Address a meaningful exception, limitation, or opposing view when useful."]],
+    conclusion: [["Synthesize","Bring the reasons together."],["Restate the position with nuance","Return to the central claim without copying it."],["Significance","Explain what follows from the argument."]],
+  },
+  "ap-lang-rhetorical": {
+    intro: [["Rhetorical situation","Identify speaker, audience, purpose, context, and constraints that matter."],["Rhetorical strategy / line of reasoning","Name the major choices the writer uses to accomplish the purpose."],["Rhetorical analysis thesis","Explain which choices the writer makes and how they advance the purpose."]],
+    body: [["Rhetorical choice","Identify the specific choice or strategy this paragraph analyzes."],["Textual evidence","Quote or precisely describe the relevant moment."],["How the choice works","Analyze diction, syntax, imagery, appeals, tone, structure, or another specific effect."],["Why it matters","Connect the effect to audience, purpose, and the writer's larger message."]],
+    conclusion: [["Synthesize the strategy","Explain how the choices work together."],["Purpose / audience takeaway","Clarify what the analysis reveals about the writer's approach."],["Larger implication","End with a meaningful insight about the rhetorical situation."]],
+  },
+  "ap-lang-synthesis": {
+    intro: [["Issue / conversation","Frame the issue and why the sources are in conversation."],["Source tension / context","Identify the key disagreement, pattern, or question across sources."],["Synthesis thesis","Take a defensible position that answers the prompt and previews your reasoning."]],
+    body: [["Argument claim","State the reasoning point—not just the source you will discuss."],["Source evidence","Select and introduce evidence from one or more sources."],["Synthesis / comparison","Put sources into conversation by connecting, contrasting, or qualifying them."],["Commentary / implication","Explain what the source conversation means for your argument."]],
+    conclusion: [["Synthesize the source conversation","Bring the major source relationships together."],["Return to the thesis","Show what the combined evidence establishes."],["Broader significance","Explain what the conclusion means beyond the individual sources."]],
+  },
+  research: {
+    intro: [["Research question","Write the focused question the paper investigates."],["Research context / gap","Explain what readers need to know and what remains unresolved."],["Working thesis","Answer the research question with a specific, arguable claim."]],
+    body: [["Section claim","State the subclaim this section contributes to the thesis."],["Source evidence","Record the strongest relevant findings, data, quotations, or examples."],["Synthesis / analysis","Compare sources and explain what the evidence means."],["Limitations / implications","Note uncertainty, counterevidence, limitations, or what follows from the evidence."]],
+    conclusion: [["Answer the research question","State what the full evidence allows you to conclude."],["Synthesize findings","Connect the major sections instead of repeating them."],["Implications / next steps","Explain significance, limitations, or future research."]],
+  },
+  "ap-seminar": {
+    intro: [["Issue / context","Define the problem and why it matters."],["Research question / perspectives","Frame the question and the perspectives that need to be considered."],["Thesis","Answer the question with a defensible, nuanced claim."]],
+    body: [["Claim","State the point this paragraph contributes."],["Evidence + source evaluation","Use credible evidence and explain why it is trustworthy or limited."],["Perspective analysis","Compare or connect perspectives and explain what each reveals."],["Implication / counterargument","Address competing reasoning and show the consequence of your conclusion."]],
+    conclusion: [["Synthesize perspectives","Show how the perspectives change or deepen the conclusion."],["Answer the question","Return to the research question with the strongest conclusion the evidence supports."],["Implications","Explain consequences, significance, or unresolved questions."]],
+  },
+  literary: {
+    intro: [["Text / context","Introduce the work and only the context needed for the interpretation."],["Interpretive tension","Identify the question, conflict, theme, or pattern you are investigating."],["Interpretive thesis","Make a specific claim about what the text means and how it creates that meaning."]],
+    body: [["Analytical claim","State what this paragraph reveals about the text."],["Textual evidence","Choose a precise quotation or textual detail."],["Close analysis","Zoom in on diction, imagery, syntax, symbolism, structure, characterization, or another choice."],["Connection to interpretation","Explain how the detail develops the larger theme or meaning."]],
+    conclusion: [["Deepen the interpretation","Return to the central interpretation at a deeper level."],["Synthesize the evidence","Show how the textual patterns work together."],["Significance","Explain what the interpretation reveals about the work as a whole."]],
+  },
+  academic: {
+    intro: [["Context","Give the background the reader needs."],["Question / issue","Frame the task or debate."],["Thesis","Answer the task with a clear, arguable claim."]],
+    body: [["Claim","State the paragraph's main point."],["Evidence","Provide specific support."],["Analysis","Explain how the evidence supports the claim."],["Connection / transition","Connect the paragraph back to the thesis and forward to the next idea."]],
+    conclusion: [["Synthesize","Bring the argument together."],["Key takeaway","Clarify what the evidence establishes."],["Significance","Explain why the conclusion matters."]],
+  },
+};
+
+function getOutlineSchema(paperType) { return OUTLINE_SCHEMAS[paperType] || OUTLINE_SCHEMAS.academic; }
+
 const DEFAULT_OUTLINE = {
   title:"Untitled outline",
   paperType:"ap-lang",
@@ -2173,8 +2265,16 @@ function OutlineBuilderPage({ userName, profile, onUpdate, onLogout, onHome, onD
     if(!outline.thesis.trim() && !outline.title.trim()){ showToast("Add a title or thesis first."); return; }
     setGenerating(true);
     try{
-      const result=await callGemini(`You are Marginal's outline coach. Build a planning outline, not a finished essay. Return ONLY JSON with shape {introduction:{context,issue,claim},bodyParagraphs:[{title,topicSentence,contextEvidence,analysis,transition}],conclusion:{restatedIdea,summary,finalThought}}. Create 3 body paragraphs. Keep each field concise and useful as planning guidance. Paper type: ${PAPER_GUIDES[outline.paperType]?.label||outline.paperType}.`, `TITLE: ${outline.title}
-THESIS: ${outline.thesis}`, token, {json:true});
+      const guide = PAPER_GUIDES[outline.paperType] || PAPER_GUIDES.academic;
+      const schema = getOutlineSchema(outline.paperType);
+      const result=await callGemini(`You are Marginal's outline coach. Build a planning outline, not a finished essay. Return ONLY JSON with shape {introduction:{context,issue,claim},bodyParagraphs:[{title,topicSentence,contextEvidence,analysis,transition}],conclusion:{restatedIdea,summary,finalThought}}. Create 3 body paragraphs. Tailor every field to the selected writing type; do not use generic essay labels when the writing type has a specialized structure.
+
+PAPER TYPE: ${guide.label}
+GUIDE: ${guide.subtitle}
+INTRO FIELDS: ${schema.intro.map(x=>x[0]).join(" | ")}
+BODY FIELDS: ${schema.body.map(x=>x[0]).join(" | ")}
+CONCLUSION FIELDS: ${schema.conclusion.map(x=>x[0]).join(" | ")}`, `TITLE: ${outline.title}
+THESIS / CENTRAL IDEA: ${outline.thesis}`, token, {json:true});
       update({...outline,introduction:{...outline.introduction,...(result.introduction||{}),claim:result.introduction?.claim||outline.thesis},bodyParagraphs:(result.bodyParagraphs||[]).slice(0,6).map((p,i)=>({...DEFAULT_OUTLINE.bodyParagraphs[Math.min(i,2)],...p,title:p.title||`Body Paragraph ${i+1}`})),conclusion:{...outline.conclusion,...(result.conclusion||{})}});
       showToast("Marginal built a planning outline. Edit it to make it yours.");
     }catch{ showToast("Couldn't build the outline right now."); }
@@ -2190,14 +2290,15 @@ THESIS: ${outline.thesis}`, token, {json:true});
     await onUpdate({...profile,drafts:[draft,...profile.drafts],outline}); onOpenDraft(draft.id);
   }
   const Field=OutlineField;
+  const schema = getOutlineSchema(outline.paperType);
   return <div className="mgn-outline-page"><TopBar userName={userName} avatar={profile.avatar} onLogout={onLogout} onHome={onHome} onStats={onStats} onLibrary={onLibrary} onOutline={()=>{}} onProfile={onProfile} onSettings={onSettings} onResearch={onResearch} onRewrite={onRewrite}/><main className="mgn-outline-main">
     <div className="mgn-page-hero"><div><div className="mgn-eyebrow">Plan before you draft</div><h1>Outline Builder</h1><p>Build the reasoning structure first. Each section tells you what the paragraph needs to accomplish.</p></div><div className="mgn-outline-actions"><button className="mgn-btn-ghost" onClick={generatePlan} disabled={generating}>{generating?<Loader2 className="mgn-spin" size={16}/>:<Wand2 size={16}/>} {generating?"Building…":"Build with Marginal"}</button><button className="mgn-btn-ghost" onClick={save}><Check size={16}/> Save outline</button><button className="mgn-btn-primary" onClick={createDraft}><PenLine size={16}/> Build draft from outline</button></div></div>
     <section className="mgn-outline-shell"><div className="mgn-outline-form">
       <div className="mgn-outline-field-row"><input className="mgn-input" value={outline.title} onChange={e=>update({...outline,title:e.target.value})} placeholder="Outline title"/><select value={outline.paperType} onChange={e=>update({...outline,paperType:e.target.value})}>{Object.entries(PAPER_GUIDES).map(([id,g])=><option key={id} value={id}>{g.label}</option>)}</select></div>
-      <div className="mgn-outline-card mgn-outline-intro"><div className="mgn-outline-section-title"><span className="mgn-outline-step">01</span><div><h3>Introduction</h3><p>Move from the situation to the argument. End with a defensible claim that responds directly to the prompt.</p></div></div><div className="mgn-outline-fields"><Field label="Context" help="Establish the background or situation." value={outline.introduction.context} onChange={v=>setIntro("context",v)} large/><Field label="Establish the situation or issue" help="Explain the problem, debate, or rhetorical situation that leads into your argument." value={outline.introduction.issue} onChange={v=>setIntro("issue",v)} large/><Field label="Defensible claim / thesis" help="For argument or synthesis, take a clear position. For rhetorical analysis, identify what the writer does and why it matters." value={outline.introduction.claim} onChange={v=>{setIntro("claim",v);update({...outline,thesis:v,introduction:{...outline.introduction,claim:v}})}} large/></div></div>
+      <div className="mgn-outline-card mgn-outline-intro"><div className="mgn-outline-section-title"><span className="mgn-outline-step">01</span><div><h3>Introduction</h3><p>Move from the situation to the argument. End with a defensible claim that responds directly to the prompt.</p></div></div><div className="mgn-outline-fields"><Field label={schema.intro[0][0]} help={schema.intro[0][1]} value={outline.introduction.context} onChange={v=>setIntro("context",v)} large/><Field label={schema.intro[1][0]} help={schema.intro[1][1]} value={outline.introduction.issue} onChange={v=>setIntro("issue",v)} large/><Field label={schema.intro[2][0]} help={schema.intro[2][1]} value={outline.introduction.claim} onChange={v=>{setIntro("claim",v);update({...outline,thesis:v,introduction:{...outline.introduction,claim:v}})}} large/></div></div>
       <div className="mgn-outline-body-header"><div><div className="mgn-outline-step">02</div><div><h3>Body Paragraphs</h3><p>Every paragraph should prove part of the thesis through evidence and analysis.</p></div></div><button className="mgn-btn-ghost" onClick={addBody}><Plus size={15}/> Add paragraph</button></div>
-      {outline.bodyParagraphs.map((p,i)=><div className="mgn-outline-card mgn-outline-body-card" key={i}><div className="mgn-outline-card-top"><div><span className="mgn-outline-kicker">Body Paragraph {i+1}</span><input className="mgn-outline-title-input" value={p.title} onChange={e=>setBody(i,"title",e.target.value)}/></div>{outline.bodyParagraphs.length>1&&<button className="mgn-icon-btn" onClick={()=>removeBody(i)} title="Remove paragraph"><Trash2 size={15}/></button>}</div><div className="mgn-outline-fields"><Field label="Topic Sentence" help="State the paragraph's main point or sub-claim and tie it to the thesis." value={p.topicSentence} onChange={v=>setBody(i,"topicSentence",v)} large/><Field label="Context and Evidence" help="Introduce concrete facts, quotes, data, or examples from reliable sources." value={p.contextEvidence} onChange={v=>setBody(i,"contextEvidence",v)} large/><Field label="Analysis / Explanation" help="Explain why the evidence matters and connect it back to what you are trying to prove." value={p.analysis} onChange={v=>setBody(i,"analysis",v)} large/><Field label="Concluding / Transition Sentence" help="Wrap up the takeaway or create a smooth path into the next point." value={p.transition} onChange={v=>setBody(i,"transition",v)} large/></div></div>)}
-      <div className="mgn-outline-card mgn-outline-conclusion"><div className="mgn-outline-section-title"><span className="mgn-outline-step">03</span><div><h3>Conclusion</h3><p>Close the argument without introducing new evidence.</p></div></div><div className="mgn-outline-fields"><Field label="Restate the main idea" help="Say your main idea again using new words—not a direct copy." value={outline.conclusion.restatedIdea} onChange={v=>setConclusion("restatedIdea",v)} large/><Field label="Summarize main points" help="Remind readers of your core arguments without adding new evidence." value={outline.conclusion.summary} onChange={v=>setConclusion("summary",v)} large/><Field label={'Final thought / “mic drop”'} help="End with a broad statement, call to action, or final insight about why the topic matters." value={outline.conclusion.finalThought} onChange={v=>setConclusion("finalThought",v)} large/></div></div>
+      {outline.bodyParagraphs.map((p,i)=><div className="mgn-outline-card mgn-outline-body-card" key={i}><div className="mgn-outline-card-top"><div><span className="mgn-outline-kicker">Body Paragraph {i+1}</span><input className="mgn-outline-title-input" value={p.title} onChange={e=>setBody(i,"title",e.target.value)}/></div>{outline.bodyParagraphs.length>1&&<button className="mgn-icon-btn" onClick={()=>removeBody(i)} title="Remove paragraph"><Trash2 size={15}/></button>}</div><div className="mgn-outline-fields"><Field label={schema.body[0][0]} help={schema.body[0][1]} value={p.topicSentence} onChange={v=>setBody(i,"topicSentence",v)} large/><Field label={schema.body[1][0]} help={schema.body[1][1]} value={p.contextEvidence} onChange={v=>setBody(i,"contextEvidence",v)} large/><Field label={schema.body[2][0]} help={schema.body[2][1]} value={p.analysis} onChange={v=>setBody(i,"analysis",v)} large/><Field label={schema.body[3][0]} help={schema.body[3][1]} value={p.transition} onChange={v=>setBody(i,"transition",v)} large/></div></div>)}
+      <div className="mgn-outline-card mgn-outline-conclusion"><div className="mgn-outline-section-title"><span className="mgn-outline-step">03</span><div><h3>Conclusion</h3><p>Close the argument without introducing new evidence.</p></div></div><div className="mgn-outline-fields"><Field label={schema.conclusion[0][0]} help={schema.conclusion[0][1]} value={outline.conclusion.restatedIdea} onChange={v=>setConclusion("restatedIdea",v)} large/><Field label={schema.conclusion[1][0]} help={schema.conclusion[1][1]} value={outline.conclusion.summary} onChange={v=>setConclusion("summary",v)} large/><Field label={schema.conclusion[2][0]} help={schema.conclusion[2][1]} value={outline.conclusion.finalThought} onChange={v=>setConclusion("finalThought",v)} large/></div></div>
     </div><aside className="mgn-outline-preview"><div className="mgn-card-head"><div><h3>Live preview</h3><p className="mgn-card-sub">Your argument at a glance.</p></div><ListTree size={19}/></div><div className="mgn-outline-tree"><div className="root">{outline.title}</div><div className="branch"><b>Introduction</b><span>{outline.introduction.context||"Context"}</span><span>{outline.introduction.issue||"Situation / issue"}</span><span>{outline.introduction.claim||"Defensible claim / thesis"}</span></div>{outline.bodyParagraphs.map((p,i)=><div className="branch" key={i}><b>{p.title}</b><span>{p.topicSentence||"Topic sentence"}</span><span>{p.contextEvidence||"Context + evidence"}</span><span>{p.analysis||"Analysis / explanation"}</span><span>{p.transition||"Concluding / transition"}</span></div>)}<div className="branch"><b>Conclusion</b><span>{outline.conclusion.restatedIdea||"Restated main idea"}</span><span>{outline.conclusion.summary||"Summary of main points"}</span><span>{outline.conclusion.finalThought||"Final thought / mic drop"}</span></div></div></aside></section></main></div>;
 }
 
