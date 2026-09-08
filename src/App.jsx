@@ -24,6 +24,31 @@ const TRAIT_LABELS = {
   directness: ["Roundabout", "Direct"],
 };
 
+function normalizeProfile(raw = {}) {
+  const base = raw || {};
+  const traits = { ...DEFAULT_TRAITS, ...(base.styleProfile?.traits || {}), ...(base.weights || {}) };
+  const styleProfile = base.styleProfile ? {
+    summary: typeof base.styleProfile.summary === "string" ? base.styleProfile.summary : "Your writing profile is ready.",
+    traits,
+    avgSentenceLength: Number(base.styleProfile.avgSentenceLength) || 0,
+    commonPhrases: Array.isArray(base.styleProfile.commonPhrases) ? base.styleProfile.commonPhrases : [],
+    quirks: Array.isArray(base.styleProfile.quirks) ? base.styleProfile.quirks : [],
+    sampleOpeners: Array.isArray(base.styleProfile.sampleOpeners) ? base.styleProfile.sampleOpeners : [],
+  } : null;
+  const drafts = Array.isArray(base.drafts) ? base.drafts.map(d => ({
+    ...d, content: typeof d.content === "string" ? d.content : "", title: d.title || "Untitled",
+    accepted: Array.isArray(d.accepted) ? d.accepted : [], rejected: Array.isArray(d.rejected) ? d.rejected : [],
+    versions: Array.isArray(d.versions) ? d.versions : [],
+  })) : [];
+  return {
+    ...base, styleProfile, weights: traits, samples: Array.isArray(base.samples) ? base.samples : [],
+    extraVoices: Array.isArray(base.extraVoices) ? base.extraVoices : [], drafts,
+    accepted: Array.isArray(base.accepted) ? base.accepted : [], rejected: Array.isArray(base.rejected) ? base.rejected : [],
+    insights: Array.isArray(base.insights) ? base.insights : [],
+    settings: { accentColor: "#7567F8", autocomplete: true, explainSuggestions: true, autoSave: true, suggestionLength: "medium", ...(base.settings || {}) },
+  };
+}
+
 const TONE_OPTIONS = [
   { id: "auto", label: "My voice" },
   { id: "professional", label: "Professional" },
@@ -246,8 +271,9 @@ export default function App() {
         .then(({ profile }) => {
           setToken(savedToken);
           setCurrentUser(savedUsername);
-          setProfile(profile);
-          setPage(profile.styleProfile ? "dashboard" : "onboarding");
+          const safeProfile = normalizeProfile(profile);
+          setProfile(safeProfile);
+          setPage(safeProfile.styleProfile ? "dashboard" : "onboarding");
         })
         .catch(() => {
           localStorage.removeItem("mgn_token");
@@ -282,8 +308,9 @@ export default function App() {
       localStorage.setItem("mgn_username", data.username);
       setToken(data.token);
       setCurrentUser(data.username);
-      setProfile(data.profile);
-      setPage(data.profile.styleProfile ? "dashboard" : "onboarding");
+      const safeProfile = normalizeProfile(data.profile);
+      setProfile(safeProfile);
+      setPage(safeProfile.styleProfile ? "dashboard" : "onboarding");
     } catch (e) {
       setAuthError(e.message);
     }
@@ -339,9 +366,10 @@ export default function App() {
               Object.entries(traits).map(([key, value]) => [key, Math.max(0, Math.min(100, Number(value)))])
             );
             const normalizedProfile = { ...styleProfile, traits: normalizedTraits };
-            const p = { ...profile, styleProfile: normalizedProfile, samples, weights: { ...profile.weights, ...normalizedTraits } };
-            await persist(p);
+            const p = normalizeProfile({ ...profile, styleProfile: normalizedProfile, samples, weights: { ...profile.weights, ...normalizedTraits } });
+            setProfile(p);
             setPage("dashboard");
+            await apiRequest("/profile", { method: "PUT", token, body: { profile: p } });
             showToast(`Marginal has your voice now, ${currentUser}.`);
           }}
         />
@@ -874,7 +902,7 @@ function Dashboard({ userName, profile, token, onUpdate, onLogout, onHome, onOpe
   const [showAddVoice, setShowAddVoice] = useState(false);
   const [showShareCard, setShowShareCard] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
-  const sp = profile.styleProfile;
+  const sp = profile.styleProfile || { summary: "Your writing profile is ready.", quirks: [] };
   const stats = computeStats(profile);
   const voices = allVoices(profile);
 
@@ -960,7 +988,7 @@ function Dashboard({ userName, profile, token, onUpdate, onLogout, onHome, onOpe
             </div>
           </div>
 
-          {profile.insights.length > 0 && (
+          {(profile.insights || []).length > 0 && (
             <div className="mgn-insights">
               <div className="mgn-insights-label">Recent insights</div>
               {profile.insights.slice(0, 3).map((ins, i) => (
