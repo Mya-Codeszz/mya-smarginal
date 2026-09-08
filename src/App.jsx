@@ -193,14 +193,19 @@ async function callGemini(system, userContent, token, { json = false } = {}) {
   const data = await apiRequest("/gemini", {
     method: "POST",
     token,
-    body: { system, messages: [{ role: "user", content: userContent }] },
+    body: { system, messages: [{ role: "user", content: userContent }], json },
   });
   const text = (data.content || []).map((b) => (b.type === "text" ? b.text : "")).join("");
   if (json) {
-    let cleaned = text.replace(/```json|```/g, "").trim();
-    const m = cleaned.match(/\{[\s\S]*\}/);
-    if (m) cleaned = m[0];
-    return JSON.parse(cleaned);
+    let cleaned = text.replace(/```json|```/gi, "").trim();
+    const first = cleaned.indexOf("{");
+    const last = cleaned.lastIndexOf("}");
+    if (first >= 0 && last > first) cleaned = cleaned.slice(first, last + 1);
+    try {
+      return JSON.parse(cleaned);
+    } catch {
+      throw new Error("Marginal received an invalid style profile from Gemini.");
+    }
   }
   return text;
 }
@@ -323,7 +328,18 @@ export default function App() {
           profile={profile}
           token={token}
           onDone={async (styleProfile, samples) => {
-            const p = { ...profile, styleProfile, samples, weights: { ...styleProfile.traits } };
+            const traits = styleProfile?.traits;
+            const validTraits = traits && ["formality", "sentenceVariety", "vocabularyComplexity", "warmth", "directness"]
+              .every((key) => Number.isFinite(Number(traits[key])));
+            if (!styleProfile || typeof styleProfile.summary !== "string" || !validTraits) {
+              showToast("Gemini returned an incomplete style profile. Please try again.");
+              return;
+            }
+            const normalizedTraits = Object.fromEntries(
+              Object.entries(traits).map(([key, value]) => [key, Math.max(0, Math.min(100, Number(value)))])
+            );
+            const normalizedProfile = { ...styleProfile, traits: normalizedTraits };
+            const p = { ...profile, styleProfile: normalizedProfile, samples, weights: { ...profile.weights, ...normalizedTraits } };
             await persist(p);
             setPage("dashboard");
             showToast(`Marginal has your voice now, ${currentUser}.`);
